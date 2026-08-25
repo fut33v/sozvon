@@ -72,6 +72,11 @@ final class RecordingStore {
         recordingsURL.appendingPathComponent(session.audioFileName)
     }
 
+    func micAudioURL(for session: RecordingSession) -> URL? {
+        guard let micAudioFileName = session.micAudioFileName else { return nil }
+        return recordingsURL.appendingPathComponent(micAudioFileName)
+    }
+
     func transcriptURL(for session: RecordingSession) -> URL {
         transcriptDirectoryURL(for: session).appendingPathComponent("transcript.txt")
     }
@@ -90,6 +95,10 @@ final class RecordingStore {
 
     func deleteAudio(for session: RecordingSession) {
         try? fileManager.removeItem(at: audioURL(for: session))
+
+        if let micURL = micAudioURL(for: session) {
+            try? fileManager.removeItem(at: micURL)
+        }
     }
 
     func deleteTranscriptFiles(for session: RecordingSession) {
@@ -126,7 +135,7 @@ final class RecordingStore {
             return
         }
 
-        writeString(currentSession.transcript, to: currentTranscriptURL)
+        writeString(currentSession.displayTranscript, to: currentTranscriptURL)
         writeMetadata(
             for: currentSession,
             isActive: currentSession.id == activeSessionID,
@@ -145,7 +154,7 @@ final class RecordingStore {
             withIntermediateDirectories: true
         )
 
-        writeString(session.transcript, to: transcriptURL(for: session))
+        writeString(session.displayTranscript, to: transcriptURL(for: session))
         writeMetadata(
             for: session,
             isActive: isActive,
@@ -168,7 +177,13 @@ final class RecordingStore {
             isActive: isActive,
             durationSeconds: session.durationSeconds,
             audioPath: audioURL(for: session).path,
-            transcriptPath: transcriptURL(for: session).path
+            micAudioPath: micAudioURL(for: session)?.path,
+            transcriptPath: transcriptURL(for: session).path,
+            transcriptKind: (session.preferredTranscriptKind ?? .live).rawValue,
+            hasWhisperTranscript: session.hasWhisperTranscript,
+            segments: session.preferredTranscriptKind == .whisper
+                ? session.whisperSegments
+                : session.segments
         )
 
         let encoder = JSONEncoder()
@@ -255,5 +270,9 @@ private struct TranscriptSessionMetadata: Encodable {
     let isActive: Bool
     let durationSeconds: TimeInterval
     let audioPath: String
+    let micAudioPath: String?
     let transcriptPath: String
+    let transcriptKind: String
+    let hasWhisperTranscript: Bool
+    let segments: [TranscriptSegment]?
 }

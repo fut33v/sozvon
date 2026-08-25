@@ -17,4 +17,14 @@ enum SpeechLanguage: String, CaseIterable, Identifiable {
             return "English UK"
         }
     }
+
+    /// ISO-639-1 code understood by whisper.cpp `--language`.
+    var whisperCode: String {
+        switch self {
+        case .russian:
+            return "ru"
+        case .englishUS, .englishUK:
+            return "en"
+        }
+    }
 }

@@ -11,6 +11,7 @@ struct CallListenerApp: App {
                 .frame(minWidth: 720, minHeight: 520)
                 .task {
                     await transcriber.refreshPermissionStatus()
+                    transcriber.refreshWhisperAvailability()
                 }
         }
         .commands {

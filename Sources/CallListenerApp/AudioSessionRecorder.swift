@@ -5,6 +5,7 @@ final class AudioSessionRecorder {
     private let queue = DispatchQueue(label: "local.call-listener.audio-recorder")
     private let url: URL
     private var audioFile: AVAudioFile?
+    private var isStopped = false
     private let reportError: (String) -> Void
 
     init(url: URL, format: AVAudioFormat? = nil, reportError: @escaping (String) -> Void) throws {
@@ -20,7 +21,7 @@ final class AudioSessionRecorder {
         guard let copiedBuffer = buffer.deepCopy() else { return }
 
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isStopped else { return }
 
             do {
                 if self.audioFile == nil {
@@ -40,6 +41,8 @@ final class AudioSessionRecorder {
 
     func stop() {
         queue.sync {
+            // Without this flag a late buffer would recreate the file and wipe the take.
+            isStopped = true
             audioFile = nil
         }
     }

@@ -29,13 +29,15 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     @Published private(set) var playbackCurrentTime: TimeInterval = 0
     @Published private(set) var playbackDuration: TimeInterval = 0
 
+    @Published var vocabulary: String = ""
+    @Published private(set) var whisperStatus = ""
+    @Published private(set) var isWhisperRunning = false
+    @Published private(set) var isWhisperConfigured = WhisperTranscriber.isConfigured
+
     private let store = RecordingStore()
     private let audioEngine = AVAudioEngine()
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var speechRecognizer: SFSpeechRecognizer?
+    private var channels: [TranscriptSpeaker: ChannelPipeline] = [:]
     private var systemAudioCapture: SystemAudioCapture?
-    private var audioRecorder: AudioSessionRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var playbackTimer: Timer?
     private var copyResetWorkItem: DispatchWorkItem?
@@ -68,7 +70,20 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     var transcript: String {
-        selectedSession?.transcript ?? ""
+        selectedSession?.displayTranscript ?? ""
+    }
+
+    var selectedMicAudioURL: URL? {
+        guard let selectedSession else { return nil }
+        return store.micAudioURL(for: selectedSession)
+    }
+
+    /// Contextual words the recognizer should expect: names, jargon, project titles.
+    var vocabularyTerms: [String] {
+        vocabulary
+            .split { $0 == "," || $0 == "\n" }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     var selectedAudioURL: URL? {
@@ -194,73 +209,188 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         stopPlayback(resetPosition: true)
         stopCurrentRecognition(finalizeSession: true)
         isStarting = true
-        statusText = selectedAudioSource == .callAudio ? "Подключаю звук звонка" : "Подключаю микрофон"
+        statusText = selectedAudioSource.connectingStatus
 
-        guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: selectedLanguage.rawValue)) else {
+        let locale = Locale(identifier: selectedLanguage.rawValue)
+
+        guard let probe = SFSpeechRecognizer(locale: locale) else {
             statusText = "Этот язык не поддерживается"
             canStart = false
             isStarting = false
             return
         }
 
-        guard recognizer.isAvailable else {
+        guard probe.isAvailable else {
             statusText = "Распознавание речи сейчас недоступно"
             isStarting = false
             return
         }
 
+        let source = selectedAudioSource
         let session = createSession()
 
-        speechRecognizer = recognizer
-        speechRecognizer?.delegate = self
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        request.shouldReportPartialResults = true
-        if #available(macOS 13.0, *) {
-            request.addsPunctuation = true
-        }
-        recognitionRequest = request
-
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-
-            if let result {
-                DispatchQueue.main.async {
-                    self.updateActiveTranscript(result.bestTranscription.formattedString)
-                }
-            }
-
-            if let error {
-                DispatchQueue.main.async {
-                    guard self.activeSessionID != nil || self.isActive else { return }
-                    self.statusText = error.localizedDescription
-                    self.stopCurrentRecognition(finalizeSession: true)
-                }
-            } else if result?.isFinal == true {
-                DispatchQueue.main.async {
-                    self.stopCurrentRecognition(finalizeSession: true)
-                    self.statusText = "Готов к прослушиванию"
-                }
-            }
-        }
-
         do {
-            switch selectedAudioSource {
-            case .callAudio:
-                try await startSystemAudioCapture(for: session, request: request)
-            case .microphone:
-                try startMicrophoneCapture(for: session, request: request)
+            if source.capturesSystemAudio {
+                let pipeline = try makePipeline(
+                    speaker: .them,
+                    locale: locale,
+                    audioURL: store.audioURL(for: session),
+                    format: nil
+                )
+                channels[.them] = pipeline
+                try await startSystemAudioCapture(pipeline: pipeline)
+            }
+
+            if source.capturesMicrophone {
+                let inputFormat = audioEngine.inputNode.outputFormat(forBus: 0)
+
+                guard inputFormat.channelCount > 0 else {
+                    throw NSError(
+                        domain: "CallListener",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "Микрофон не найден"]
+                    )
+                }
+
+                // Mic-only sessions keep writing to the primary audio file so older
+                // recordings and the player keep working unchanged.
+                let micURL = source.labelsSpeakers
+                    ? (store.micAudioURL(for: session) ?? store.audioURL(for: session))
+                    : store.audioURL(for: session)
+
+                let pipeline = try makePipeline(
+                    speaker: .me,
+                    locale: locale,
+                    audioURL: micURL,
+                    format: inputFormat
+                )
+                channels[.me] = pipeline
+                try startMicrophoneCapture(pipeline: pipeline, format: inputFormat)
             }
 
             isStarting = false
             isListening = true
-            statusText = selectedAudioSource.listeningStatus
+            statusText = source.listeningStatus
         } catch {
             let failedSessionID = session.id
             stopCurrentRecognition(finalizeSession: false)
             discardSession(withID: failedSessionID)
             statusText = friendlyCaptureError(error)
         }
+    }
+
+    @MainActor
+    private func makePipeline(
+        speaker: TranscriptSpeaker,
+        locale: Locale,
+        audioURL: URL,
+        format: AVAudioFormat?
+    ) throws -> ChannelPipeline {
+        guard let recognizer = SFSpeechRecognizer(locale: locale) else {
+            throw NSError(
+                domain: "CallListener",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Этот язык не поддерживается"]
+            )
+        }
+
+        recognizer.delegate = self
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        request.shouldReportPartialResults = true
+        request.taskHint = .dictation
+        // Names, jargon and project titles are where the recognizer slips most.
+        request.contextualStrings = vocabularyTerms
+
+        if #available(macOS 13.0, *) {
+            request.addsPunctuation = true
+        }
+
+        let recorder = try AudioSessionRecorder(url: audioURL, format: format) { [weak self] message in
+            DispatchQueue.main.async {
+                self?.statusText = message
+            }
+        }
+
+        let pipeline = ChannelPipeline(
+            speaker: speaker,
+            recognizer: recognizer,
+            request: request,
+            recorder: recorder
+        )
+
+        pipeline.task = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+
+            if let result {
+                let rawSegments = result.bestTranscription.segments.map {
+                    RecognizedWord(
+                        substring: $0.substring,
+                        timestamp: $0.timestamp,
+                        duration: $0.duration
+                    )
+                }
+                let formatted = result.bestTranscription.formattedString
+
+                DispatchQueue.main.async {
+                    self.updateChannel(speaker: speaker, rawSegments: rawSegments, formatted: formatted)
+                }
+            }
+
+            if error != nil || result?.isFinal == true {
+                DispatchQueue.main.async {
+                    self.channelDidFinish(speaker: speaker, error: error)
+                }
+            }
+        }
+
+        return pipeline
+    }
+
+    @MainActor
+    private func updateChannel(
+        speaker: TranscriptSpeaker,
+        rawSegments: [RecognizedWord],
+        formatted: String
+    ) {
+        guard let pipeline = channels[speaker] else { return }
+
+        pipeline.segments = TranscriptSegment.utterances(from: rawSegments, speaker: speaker)
+        pipeline.formattedString = formatted
+
+        updateActiveTranscript()
+    }
+
+    /// One channel failing must not discard the other channel's transcript, so the
+    /// session is only finalized once every channel has stopped.
+    @MainActor
+    private func channelDidFinish(speaker: TranscriptSpeaker, error: Error?) {
+        guard let pipeline = channels[speaker] else { return }
+
+        channels[speaker] = nil
+        pipeline.stop()
+
+        // Stop feeding a dead pipeline.
+        switch speaker {
+        case .me:
+            if audioEngine.isRunning {
+                audioEngine.stop()
+                audioEngine.inputNode.removeTap(onBus: 0)
+            }
+        case .them:
+            systemAudioCapture?.stop()
+            systemAudioCapture = nil
+        }
+
+        guard channels.isEmpty else {
+            if error != nil {
+                statusText = "\(speaker.title): канал остановлен, продолжаю"
+            }
+            return
+        }
+
+        stopCurrentRecognition(finalizeSession: true)
+        statusText = error?.localizedDescription ?? "Готов к прослушиванию"
     }
 
     @MainActor
@@ -277,6 +407,10 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         sessions[index].transcript = ""
+        sessions[index].segments = []
+        sessions[index].whisperTranscript = nil
+        sessions[index].whisperSegments = nil
+        sessions[index].preferredTranscriptKind = .live
         sessions[index].updatedAt = Date()
         persistSessions()
     }
@@ -296,6 +430,127 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         }
         copyResetWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
+    }
+
+    var canRunWhisper: Bool {
+        guard let selectedSession, selectedSession.id != activeSessionID else { return false }
+        guard isWhisperConfigured, !isWhisperRunning else { return false }
+        return FileManager.default.fileExists(atPath: store.audioURL(for: selectedSession).path)
+    }
+
+    var selectedTranscriptKind: TranscriptKind {
+        selectedSession?.preferredTranscriptKind ?? .live
+    }
+
+    @MainActor
+    func refreshWhisperAvailability() {
+        isWhisperConfigured = WhisperTranscriber.isConfigured
+    }
+
+    /// Re-runs the finished recording through whisper.cpp. The live Apple Speech pass
+    /// stays untouched so both versions remain available.
+    @MainActor
+    func runWhisperOnSelectedSession() {
+        guard let session = selectedSession,
+              session.id != activeSessionID,
+              !isWhisperRunning else {
+            return
+        }
+
+        let inputs = whisperInputs(for: session)
+
+        guard !inputs.isEmpty else {
+            whisperStatus = "Нет аудиофайла для распознавания"
+            return
+        }
+
+        isWhisperRunning = true
+        whisperStatus = "Whisper: запускаю"
+
+        let language = session.language
+        let terms = vocabularyTerms
+        let labelSpeakers = session.source.labelsSpeakers
+        let sessionID = session.id
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+
+            do {
+                let segments = try WhisperTranscriber.transcribe(
+                    inputs: inputs,
+                    language: language,
+                    vocabulary: terms
+                ) { message in
+                    Task { @MainActor in
+                        self.whisperStatus = message
+                    }
+                }
+
+                await MainActor.run {
+                    self.applyWhisperResult(segments, to: sessionID, labelSpeakers: labelSpeakers)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isWhisperRunning = false
+                    self.whisperStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func toggleTranscriptKind() {
+        guard let selectedSessionID,
+              let index = sessions.firstIndex(where: { $0.id == selectedSessionID }),
+              sessions[index].hasWhisperTranscript else {
+            return
+        }
+
+        sessions[index].preferredTranscriptKind =
+            sessions[index].preferredTranscriptKind == .whisper ? .live : .whisper
+        sessions[index].updatedAt = Date()
+        persistSessions()
+    }
+
+    private func whisperInputs(for session: RecordingSession) -> [WhisperTranscriber.Input] {
+        var inputs: [WhisperTranscriber.Input] = []
+
+        // Without a separate mic file the single recording belongs to whichever
+        // side that session actually captured.
+        let primarySpeaker: TranscriptSpeaker = session.source.capturesSystemAudio ? .them : .me
+        inputs.append(
+            WhisperTranscriber.Input(audioURL: store.audioURL(for: session), speaker: primarySpeaker)
+        )
+
+        if let micURL = store.micAudioURL(for: session) {
+            inputs.append(WhisperTranscriber.Input(audioURL: micURL, speaker: .me))
+        }
+
+        return inputs.filter { FileManager.default.fileExists(atPath: $0.audioURL.path) }
+    }
+
+    @MainActor
+    private func applyWhisperResult(
+        _ segments: [TranscriptSegment],
+        to id: RecordingSession.ID,
+        labelSpeakers: Bool
+    ) {
+        isWhisperRunning = false
+
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else {
+            whisperStatus = "Сеанс больше не существует"
+            return
+        }
+
+        sessions[index].whisperSegments = segments
+        sessions[index].whisperTranscript = labelSpeakers
+            ? segments.mergedTranscript()
+            : segments.map(\.text).joined(separator: " ")
+        sessions[index].preferredTranscriptKind = .whisper
+        sessions[index].updatedAt = Date()
+        persistSessions()
+
+        whisperStatus = "Whisper: готово"
     }
 
     @MainActor
@@ -400,38 +655,20 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         store.audioURL(for: session)
     }
 
-    private func startMicrophoneCapture(
-        for session: RecordingSession,
-        request: SFSpeechAudioBufferRecognitionRequest
-    ) throws {
+    private func startMicrophoneCapture(pipeline: ChannelPipeline, format: AVAudioFormat) throws {
         let inputNode = audioEngine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-
-        guard recordingFormat.channelCount > 0 else {
-            throw NSError(
-                domain: "CallListener",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Микрофон не найден"]
-            )
-        }
-
-        let recorder = try makeRecorder(for: session, format: recordingFormat)
-        audioRecorder = recorder
 
         inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-            request.append(buffer)
-            recorder.append(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+            pipeline.request.append(buffer)
+            pipeline.recorder.append(buffer)
         }
 
         audioEngine.prepare()
         try audioEngine.start()
     }
 
-    private func startSystemAudioCapture(
-        for session: RecordingSession,
-        request: SFSpeechAudioBufferRecognitionRequest
-    ) async throws {
+    private func startSystemAudioCapture(pipeline: ChannelPipeline) async throws {
         guard #available(macOS 13.0, *) else {
             throw NSError(
                 domain: "CallListener",
@@ -440,13 +677,10 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
             )
         }
 
-        let recorder = try makeRecorder(for: session, format: nil)
-        audioRecorder = recorder
-
         let capture = SystemAudioCapture { buffer in
-            request.append(buffer)
+            pipeline.request.append(buffer)
         } appendRecordingBuffer: { buffer in
-            recorder.append(buffer)
+            pipeline.recorder.append(buffer)
         } reportError: { [weak self] message in
             DispatchQueue.main.async {
                 self?.statusText = message
@@ -454,21 +688,7 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         systemAudioCapture = capture
-        try await capture.start(includeMicrophone: false)
-    }
-
-    private func makeRecorder(
-        for session: RecordingSession,
-        format: AVAudioFormat?
-    ) throws -> AudioSessionRecorder {
-        try AudioSessionRecorder(
-            url: store.audioURL(for: session),
-            format: format
-        ) { [weak self] message in
-            DispatchQueue.main.async {
-                self?.statusText = message
-            }
-        }
+        try await capture.start()
     }
 
     @MainActor
@@ -482,12 +702,19 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
             createdAt: now,
             updatedAt: now,
             audioFileName: "\(id.uuidString).caf",
+            micAudioFileName: selectedAudioSource.labelsSpeakers
+                ? "\(id.uuidString)-mic.caf"
+                : nil,
             transcriptDirectoryName: store.makeTranscriptDirectoryName(
                 title: title,
                 createdAt: now,
                 id: id
             ),
             transcript: "",
+            segments: [],
+            whisperTranscript: nil,
+            whisperSegments: nil,
+            preferredTranscriptKind: .live,
             sourceRawValue: selectedAudioSource.rawValue,
             languageRawValue: selectedLanguage.rawValue,
             durationSeconds: 0
@@ -503,13 +730,25 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func updateActiveTranscript(_ transcript: String) {
+    private func updateActiveTranscript() {
         guard let activeSessionID,
               let index = sessions.firstIndex(where: { $0.id == activeSessionID }) else {
             return
         }
 
-        sessions[index].transcript = transcript
+        let allSegments = channels.values
+            .flatMap { $0.segments }
+            .sorted { $0.startSeconds < $1.startSeconds }
+
+        sessions[index].segments = allSegments
+
+        if sessions[index].source.labelsSpeakers {
+            sessions[index].transcript = allSegments.mergedTranscript()
+        } else {
+            // Single channel: the recognizer's own formatting beats re-joining words.
+            sessions[index].transcript = channels.values.first?.formattedString ?? ""
+        }
+
         sessions[index].updatedAt = Date()
         persistSessions()
     }
@@ -570,7 +809,7 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     private func friendlyCaptureError(_ error: Error) -> String {
         let message = error.localizedDescription
 
-        if selectedAudioSource == .callAudio {
+        if selectedAudioSource.capturesSystemAudio {
             return message == "The user declined the application." || message.contains("declined")
                 ? "Нет доступа к записи экрана или системному звуку"
                 : message
@@ -648,13 +887,10 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
             audioEngine.inputNode.removeTap(onBus: 0)
         }
 
-        audioRecorder?.stop()
-        audioRecorder = nil
-
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
+        // Clear first: stopping a pipeline re-enters channelDidFinish.
+        let activePipelines = channels
+        channels.removeAll()
+        activePipelines.values.forEach { $0.stop() }
 
         if finalizeSession {
             finishActiveSession()
@@ -751,5 +987,35 @@ extension SpeechTranscriber: AVAudioPlayerDelegate {
             self.statusText = "Не удалось воспроизвести запись"
             self.stopPlayback(resetPosition: true)
         }
+    }
+}
+
+/// One capture channel: its own recorder, recognizer and running transcript.
+private final class ChannelPipeline {
+    let speaker: TranscriptSpeaker
+    let recognizer: SFSpeechRecognizer
+    let request: SFSpeechAudioBufferRecognitionRequest
+    let recorder: AudioSessionRecorder
+    var task: SFSpeechRecognitionTask?
+    var segments: [TranscriptSegment] = []
+    var formattedString = ""
+
+    init(
+        speaker: TranscriptSpeaker,
+        recognizer: SFSpeechRecognizer,
+        request: SFSpeechAudioBufferRecognitionRequest,
+        recorder: AudioSessionRecorder
+    ) {
+        self.speaker = speaker
+        self.recognizer = recognizer
+        self.request = request
+        self.recorder = recorder
+    }
+
+    func stop() {
+        request.endAudio()
+        task?.cancel()
+        task = nil
+        recorder.stop()
     }
 }

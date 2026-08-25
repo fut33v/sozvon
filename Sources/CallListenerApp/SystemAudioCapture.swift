@@ -48,7 +48,7 @@ final class SystemAudioCapture: NSObject {
         self.reportError = reportError
     }
 
-    func start(includeMicrophone: Bool) async throws {
+    func start() async throws {
         let content = try await SCShareableContent.current
 
         guard let display = content.displays.first else {
@@ -74,16 +74,8 @@ final class SystemAudioCapture: NSObject {
         configuration.channelCount = Self.captureChannelCount
         configuration.excludesCurrentProcessAudio = true
 
-        if #available(macOS 15.0, *) {
-            configuration.captureMicrophone = includeMicrophone
-        }
-
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: outputQueue)
-
-        if #available(macOS 15.0, *), includeMicrophone {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: outputQueue)
-        }
 
         self.stream = stream
 
@@ -211,14 +203,8 @@ extension SystemAudioCapture: SCStreamOutput {
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        if type == .audio {
-            handle(sampleBuffer: sampleBuffer)
-            return
-        }
-
-        if #available(macOS 15.0, *), type == .microphone {
-            handle(sampleBuffer: sampleBuffer)
-        }
+        guard type == .audio else { return }
+        handle(sampleBuffer: sampleBuffer)
     }
 }
 

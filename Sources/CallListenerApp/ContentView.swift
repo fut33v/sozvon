@@ -40,7 +40,7 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 180)
+            .frame(width: 232)
             .disabled(transcriber.isActive)
 
             Picker("Язык", selection: $transcriber.selectedLanguage) {
@@ -121,6 +121,10 @@ struct ContentView: View {
             Divider()
 
             transcriptFileBar
+
+            Divider()
+
+            whisperBar
 
             Divider()
 
@@ -278,6 +282,66 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .help("Скопировать путь к txt")
             .disabled(transcriber.selectedTranscriptPath.isEmpty)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var whisperBar: some View {
+        HStack(spacing: 10) {
+            Label("Словарь", systemImage: "text.book.closed")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            TextField(
+                "Имена, термины, названия проектов через запятую",
+                text: $transcriber.vocabulary
+            )
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .frame(minWidth: 180)
+            .help("Подсказки распознавалке: имена коллег, жаргон, названия. Применяются к новым сеансам и к Whisper.")
+
+            Divider()
+                .frame(height: 20)
+
+            if transcriber.selectedSession?.hasWhisperTranscript == true {
+                Picker("", selection: Binding(
+                    get: { transcriber.selectedTranscriptKind },
+                    set: { _ in transcriber.toggleTranscriptKind() }
+                )) {
+                    Text("Live").tag(TranscriptKind.live)
+                    Text("Whisper").tag(TranscriptKind.whisper)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 148)
+            }
+
+            Button {
+                transcriber.runWhisperOnSelectedSession()
+            } label: {
+                Label(
+                    transcriber.isWhisperRunning ? "Считаю…" : "Уточнить Whisper",
+                    systemImage: "wand.and.stars"
+                )
+            }
+            .disabled(!transcriber.canRunWhisper)
+            .help(
+                transcriber.isWhisperConfigured
+                    ? "Перераспознать запись локально через whisper.cpp"
+                    : "Whisper не настроен — запустите Scripts/setup_whisper.sh"
+            )
+
+            if !transcriber.whisperStatus.isEmpty {
+                Text(transcriber.whisperStatus)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 220, alignment: .leading)
+            }
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 10)
