@@ -42,6 +42,8 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     private var playbackTimer: Timer?
     private var copyResetWorkItem: DispatchWorkItem?
     private var sharedCurrentSessionID: RecordingSession.ID?
+    private var lastPersistDate: Date?
+    private var pendingPersistWorkItem: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -750,7 +752,7 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         }
 
         sessions[index].updatedAt = Date()
-        persistSessions()
+        persistSessionsThrottled()
     }
 
     @MainActor
@@ -799,11 +801,42 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func persistSessions() {
+        pendingPersistWorkItem?.cancel()
+        pendingPersistWorkItem = nil
+        lastPersistDate = Date()
+
         store.saveSessions(
             sessions,
             activeSessionID: activeSessionID,
             currentSessionID: sharedCurrentSessionID
         )
+    }
+
+    /// Partial results arrive several times a second; writing the whole index and
+    /// every transcript file that often is pure waste. Coalesce to ~1 Hz while
+    /// recording, and always flush on stop via `persistSessions()`.
+    @MainActor
+    private func persistSessionsThrottled() {
+        let minimumInterval: TimeInterval = 1
+
+        if let lastPersistDate, Date().timeIntervalSince(lastPersistDate) < minimumInterval {
+            guard pendingPersistWorkItem == nil else { return }
+
+            let item = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.pendingPersistWorkItem = nil
+                    self.persistSessions()
+                }
+            }
+            pendingPersistWorkItem = item
+
+            let delay = minimumInterval - Date().timeIntervalSince(lastPersistDate)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+            return
+        }
+
+        persistSessions()
     }
 
     private func friendlyCaptureError(_ error: Error) -> String {
