@@ -120,6 +120,10 @@ struct ContentView: View {
 
             Divider()
 
+            transcriptFileBar
+
+            Divider()
+
             transcriptArea
 
             Divider()
@@ -238,6 +242,42 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .help("Скопировать путь")
             .disabled(transcriber.selectedSession == nil)
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var transcriptFileBar: some View {
+        HStack(spacing: 10) {
+            Label("TXT сеанса", systemImage: "doc.text")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+
+            Text(transcriber.selectedTranscriptPath.isEmpty ? "Нет выбранного сеанса" : transcriber.selectedTranscriptPath)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(transcriber.selectedTranscriptPath.isEmpty ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+                }
+
+            Button {
+                transcriber.copySelectedTranscriptPath()
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.bordered)
+            .help("Скопировать путь к txt")
+            .disabled(transcriber.selectedTranscriptPath.isEmpty)
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 10)

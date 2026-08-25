@@ -39,12 +39,23 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     private var audioPlayer: AVAudioPlayer?
     private var playbackTimer: Timer?
     private var copyResetWorkItem: DispatchWorkItem?
+    private var sharedCurrentSessionID: RecordingSession.ID?
 
     override init() {
         super.init()
 
         sessions = store.loadSessions()
+        migrateTranscriptDirectoriesIfNeeded()
         selectedSessionID = sessions.first?.id
+        sharedCurrentSessionID = sessions.first?.id
+
+        if !sessions.isEmpty {
+            store.saveSessions(
+                sessions,
+                activeSessionID: activeSessionID,
+                currentSessionID: sharedCurrentSessionID
+            )
+        }
     }
 
     var isActive: Bool {
@@ -63,6 +74,15 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     var selectedAudioURL: URL? {
         guard let selectedSession else { return nil }
         return store.audioURL(for: selectedSession)
+    }
+
+    var selectedTranscriptURL: URL? {
+        guard let selectedSession else { return nil }
+        return store.transcriptURL(for: selectedSession)
+    }
+
+    var selectedTranscriptPath: String {
+        selectedTranscriptURL?.path ?? ""
     }
 
     var canPlaySelectedAudio: Bool {
@@ -367,6 +387,15 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    func copySelectedTranscriptPath() {
+        guard let selectedTranscriptURL else { return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(selectedTranscriptURL.path, forType: .string)
+        statusText = "Путь к txt скопирован"
+    }
+
+    @MainActor
     func audioURL(for session: RecordingSession) -> URL {
         store.audioURL(for: session)
     }
@@ -446,12 +475,18 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
     private func createSession() -> RecordingSession {
         let now = Date()
         let id = UUID()
+        let title = Self.defaultSessionTitle(for: now)
         let session = RecordingSession(
             id: id,
-            title: Self.defaultSessionTitle(for: now),
+            title: title,
             createdAt: now,
             updatedAt: now,
             audioFileName: "\(id.uuidString).caf",
+            transcriptDirectoryName: store.makeTranscriptDirectoryName(
+                title: title,
+                createdAt: now,
+                id: id
+            ),
             transcript: "",
             sourceRawValue: selectedAudioSource.rawValue,
             languageRawValue: selectedLanguage.rawValue,
@@ -461,6 +496,7 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         sessions.insert(session, at: 0)
         selectedSessionID = id
         activeSessionID = id
+        sharedCurrentSessionID = id
         persistSessions()
 
         return session
@@ -493,6 +529,7 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
 
         let session = sessions.remove(at: index)
         store.deleteAudio(for: session)
+        store.deleteTranscriptFiles(for: session)
 
         if selectedSessionID == id {
             selectedSessionID = sessions.first?.id
@@ -500,6 +537,10 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
 
         if activeSessionID == id {
             activeSessionID = nil
+        }
+
+        if sharedCurrentSessionID == id {
+            sharedCurrentSessionID = sessions.first?.id
         }
 
         persistSessions()
@@ -515,12 +556,15 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         let now = Date()
         sessions[index].durationSeconds = max(0, now.timeIntervalSince(sessions[index].createdAt))
         sessions[index].updatedAt = now
-        persistSessions()
     }
 
     @MainActor
     private func persistSessions() {
-        store.saveSessions(sessions)
+        store.saveSessions(
+            sessions,
+            activeSessionID: activeSessionID,
+            currentSessionID: sharedCurrentSessionID
+        )
     }
 
     private func friendlyCaptureError(_ error: Error) -> String {
@@ -594,6 +638,8 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func stopCurrentRecognition(finalizeSession: Bool) {
+        let hadActiveSession = activeSessionID != nil
+
         systemAudioCapture?.stop()
         systemAudioCapture = nil
 
@@ -617,6 +663,10 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         activeSessionID = nil
         isListening = false
         isStarting = false
+
+        if finalizeSession && hadActiveSession {
+            persistSessions()
+        }
     }
 
     private func requestSpeechAuthorizationIfNeeded() async -> SFSpeechRecognizerAuthorizationStatus {
@@ -654,6 +704,23 @@ final class SpeechTranscriber: NSObject, ObservableObject, @unchecked Sendable {
         formatter.locale = Locale(identifier: "ru_RU")
         formatter.dateFormat = "d MMM HH:mm"
         return "Сеанс \(formatter.string(from: date))"
+    }
+
+    private func migrateTranscriptDirectoriesIfNeeded() {
+        var didChange = false
+
+        for index in sessions.indices where sessions[index].transcriptDirectoryName == nil {
+            sessions[index].transcriptDirectoryName = store.makeTranscriptDirectoryName(
+                title: sessions[index].title,
+                createdAt: sessions[index].createdAt,
+                id: sessions[index].id
+            )
+            didChange = true
+        }
+
+        if didChange {
+            store.saveSessions(sessions, currentSessionID: sessions.first?.id)
+        }
     }
 }
 

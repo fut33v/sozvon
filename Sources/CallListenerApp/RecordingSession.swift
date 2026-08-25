@@ -6,6 +6,7 @@ struct RecordingSession: Codable, Identifiable, Hashable {
     let createdAt: Date
     var updatedAt: Date
     let audioFileName: String
+    var transcriptDirectoryName: String?
     var transcript: String
     let sourceRawValue: String
     let languageRawValue: String

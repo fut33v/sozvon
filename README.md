@@ -29,3 +29,17 @@ dist/СОЗВОН.app
 ```text
 ~/Library/Application Support/SOZVON/
 ```
+
+Live-транскрипты для Codex, Claude Code и других локальных агентов пишутся в:
+
+```text
+LiveTranscripts/
+  current-transcript.txt
+  current-session.json
+  sessions/
+    <session-folder>/
+      transcript.txt
+      session.json
+```
+
+`current-transcript.txt` обновляется во время активного сеанса. У каждого сеанса также есть отдельный `transcript.txt`; путь к нему показывается в окне приложения и копируется отдельной кнопкой.
